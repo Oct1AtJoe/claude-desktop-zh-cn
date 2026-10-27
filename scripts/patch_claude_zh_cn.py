@@ -752,9 +752,10 @@ def install_dynamic_locale(app: Path, lang_code: str) -> None:
         # Claude < 2.9939.2 没有 dynamic 目录，无需处理。
         return
     # 2.9939.2 起 dynamic catalog 与主语言包一起强制加载（fetch 非 2xx 直接抛错），
-    # 缺失会让整个 zh 语言包加载失败并回退英文。其 key 是内容哈希，随包词表暂无
-    # 对应翻译，先按官方 en-US 原文兜底，保证加载不失败。
-    shutil.copy2(source, dynamic_dir / f"{lang_code}.json")
+    # 缺失会让整个 zh 语言包加载失败并回退英文。有随包中文 dynamic 词表时优先使用，
+    # 否则按官方 en-US 原文兜底，保证加载不失败。
+    localized = RESOURCES / f"dynamic-{lang_code}.json"
+    shutil.copy2(localized if localized.exists() else source, dynamic_dir / f"{lang_code}.json")
     print(f"Installed frontend dynamic {lang_code} resource")
 
 

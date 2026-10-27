@@ -709,12 +709,15 @@ function Install-LanguageFiles {
     Write-Host "  installed ion-dist/i18n/statsig/$Lang.json" -ForegroundColor Green
 
     # Claude 2.9939.2 起前端强制加载 dynamic catalog，缺失会让整个语言包加载失败并
-    # 回退英文。其 key 为内容哈希、随包词表暂无对应翻译，按官方 en-US 原文兜底。
+    # 回退英文。若项目自带对应的中文 dynamic 词表则优先使用，否则按官方 en-US 原文兜底。
     $dynamicDir = Join-Path $i18nDir "dynamic"
     $dynamicEn = Join-Path $dynamicDir "en-US.json"
     if (Test-Path $dynamicEn) {
+        $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+        $localizedDynamic = Join-Path (Split-Path -Parent $scriptDir) "resources\dynamic-$Lang.json"
+        $dynamicSource = if (Test-Path $localizedDynamic) { $localizedDynamic } else { $dynamicEn }
         New-Item -ItemType Directory -Path $dynamicDir -Force | Out-Null
-        Copy-Item $dynamicEn (Join-Path $dynamicDir "$Lang.json") -Force
+        Copy-Item $dynamicSource (Join-Path $dynamicDir "$Lang.json") -Force
         Write-Host "  installed ion-dist/i18n/dynamic/$Lang.json" -ForegroundColor Green
     }
 }
