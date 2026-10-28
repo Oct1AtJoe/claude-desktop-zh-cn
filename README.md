@@ -186,7 +186,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests/Test-AsarRoundTrip.ps1
 - 复制 Claude.app 到临时目录并打补丁。
 - 给前端语言白名单加入当前选择的中文变体。
 - 汉化前端 bundle 中未走 i18n key 的硬编码文本，并修正中文语言显示名称。
-- 不修改 `Contents/Resources/app.asar`：在线账号界面由 Claude 原生提供中文，本项目不再注入 DOM 翻译、语言锁定或模型选择器补丁，因此不需要同步 `ElectronAsarIntegrity`。
+- 不修改 `Contents/Resources/app.asar`：在线账号界面由 Claude 原生提供中文，本项目不再注入 DOM 翻译、语言锁定或模型选择器补丁。
+- Claude `4.29+` 的前端改为 `Contents/Resources/ion-dist.asar`：脚本会先备份原包，解包到临时 `ion-dist` 目录执行汉化，再按 ASAR 格式重打包并校验结构；重打包后同步 `Info.plist` 中 `ElectronAsarIntegrity` 的 `Resources/ion-dist.asar` 头哈希，避免应用因完整性校验失败无法加载前端。`4.29` 之前的目录布局保持原有逻辑。
 - 合并当前 Claude 版本的 `en-US.json` 和随包中文翻译：
   当前版本已有中文翻译的 key 会变中文，新版本新增但本包没有的 key 会保留英文，避免应用缺字段。
 - 写入 `~/Library/Application Support/Claude/config.json`，设置 `"locale"` 为所选语言代码（`zh-CN`、`zh-TW` 或 `zh-HK`）。

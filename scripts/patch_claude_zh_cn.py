@@ -39,8 +39,15 @@ RESOURCES = ROOT / "resources"
 BACKUP_GLOB = "Claude.backup-before-zh-CN-*.app"
 
 APP_ASAR_REL = Path("Contents/Resources/app.asar")
-FRONTEND_I18N_REL = Path("Contents/Resources/ion-dist/i18n")
-FRONTEND_ASSETS_REL = Path("Contents/Resources/ion-dist/assets/v1")
+ELECTRON_FRAMEWORK_REL = Path("Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework")
+# Electron 37+ 在 macOS 的 Electron Framework 里预埋字典摘要槽位（sentinel + used + version + SHA256），
+# 运行时用它校验整个 ElectronAsarIntegrity 字典未被篡改；改动字典后必须同步更新该槽位。
+INTEGRITY_DIGEST_SENTINEL = b"AGbevlPCksUGKNL8TSn7wGmJEuJsXb2A"
+# Claude 4.29 起前端整体打包为 ion-dist.asar；更早版本是 ion-dist 目录。
+FRONTEND_ASAR_REL = Path("Contents/Resources/ion-dist.asar")
+FRONTEND_DIR_REL = Path("Contents/Resources/ion-dist")
+FRONTEND_I18N_REL = FRONTEND_DIR_REL / "i18n"
+FRONTEND_ASSETS_REL = FRONTEND_DIR_REL / "assets/v1"
 FRONTEND_PROBE_NEEDLE = '"en-US","de-DE","fr-FR","ko-KR","ja-JP"'
 DESKTOP_RESOURCES_REL = Path("Contents/Resources")
 ASAR_INTEGRITY_BLOCK_SIZE = 4 * 1024 * 1024
@@ -611,6 +618,336 @@ def read_asar_header(data: bytes, path: Path) -> tuple[int, str, dict[str, Any]]
     if not isinstance(header, dict):
         raise SystemExit(f"Unsupported app.asar header JSON in {path}")
     return header_size, header_string, header
+
+
+def walk_asar_entries(header: dict[str, Any]):
+    """Yield (relative_path, entry) for every file entry in an ASAR header."""
+    stack: list[tuple[str, dict[str, Any]]] = [("", header)]
+    while stack:
+        prefix, node = stack.pop()
+        files = node.get("files") if isinstance(node, dict) else None
+        if not isinstance(files, dict):
+            continue
+        for name, child in files.items():
+            if not isinstance(child, dict):
+                continue
+            relative = f"{prefix}/{name}" if prefix else name
+            if "files" in child:
+                stack.append((relative, child))
+            else:
+                yield relative, child
+
+
+def asar_entry(header: dict[str, Any], relative: str) -> dict[str, Any] | None:
+    node: Any = header
+    for part in relative.split("/"):
+        files = node.get("files") if isinstance(node, dict) else None
+        if not isinstance(files, dict) or part not in files:
+            return None
+        node = files[part]
+    if not isinstance(node, dict) or "files" in node:
+        return None
+    return node
+
+
+def read_asar_entry(data: bytes, header_size: int, header: dict[str, Any], relative: str) -> bytes | None:
+    """Read one file entry from an in-memory ASAR archive."""
+    entry = asar_entry(header, relative)
+    if entry is None or entry.get("unpacked"):
+        return None
+    offset = int(entry["offset"])
+    size = int(entry["size"])
+    start = 8 + header_size + offset
+    if offset < 0 or size < 0 or start + size > len(data):
+        raise SystemExit(f"ASAR 文件边界无效: {relative}")
+    return data[start : start + size]
+
+
+def asar_header_hash(header_string: str) -> str:
+    return hashlib.sha256(header_string.encode("utf-8")).hexdigest()
+
+
+def _asar_integrity(path: Path) -> dict[str, Any]:
+    data = path.read_bytes()
+    blocks = [
+        hashlib.sha256(data[offset : offset + ASAR_INTEGRITY_BLOCK_SIZE]).hexdigest()
+        for offset in range(0, len(data), ASAR_INTEGRITY_BLOCK_SIZE)
+    ]
+    if not blocks:
+        blocks = [hashlib.sha256(b"").hexdigest()]
+    return {
+        "algorithm": "SHA256",
+        "hash": hashlib.sha256(data).hexdigest(),
+        "blockSize": ASAR_INTEGRITY_BLOCK_SIZE,
+        "blocks": blocks,
+    }
+
+
+def extract_asar(asar_path: Path, destination: Path, unpacked: set[str] | None = None) -> None:
+    """Expand an ASAR archive into *destination*.
+
+    Files flagged ``unpacked`` are copied from the sibling ``.unpacked`` directory;
+    their relative paths are recorded in *unpacked* so repacking can preserve them.
+    """
+    data = asar_path.read_bytes()
+    header_size, _header_string, header = read_asar_header(data, asar_path)
+    data_start = 8 + header_size
+    unpacked_root = Path(str(asar_path) + ".unpacked")
+    destination.mkdir(parents=True, exist_ok=True)
+    root = destination.resolve()
+
+    for relative, entry in walk_asar_entries(header):
+        parts = relative.split("/")
+        if any(part in ("", ".", "..") or "\\" in part for part in parts):
+            raise SystemExit(f"ASAR 包含不安全路径: {relative}")
+        target = (destination / Path(*parts)).resolve()
+        if target != root and root not in target.parents:
+            raise SystemExit(f"ASAR 路径越界: {relative}")
+        if entry.get("link"):
+            raise SystemExit(f"暂不支持包含软链接的 ASAR: {relative}")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if entry.get("unpacked"):
+            source = unpacked_root / Path(*parts)
+            if not source.is_file():
+                raise SystemExit(f"ASAR unpacked 文件缺失: {relative}")
+            shutil.copy2(source, target)
+            if unpacked is not None:
+                unpacked.add(relative)
+            continue
+
+        offset = int(entry["offset"])
+        size = int(entry["size"])
+        if offset < 0 or size < 0 or data_start + offset + size > len(data):
+            raise SystemExit(f"ASAR 文件边界无效: {relative}")
+        target.write_bytes(data[data_start + offset : data_start + offset + size])
+
+
+def build_asar(source_dir: Path, destination: Path, unpacked: set[str] | None = None) -> None:
+    """Pack *source_dir* into an Electron-compatible ASAR archive."""
+    unpacked = unpacked or set()
+    file_entries: list[tuple[Path, str, dict[str, Any]]] = []
+
+    def walk(directory: Path, node: dict[str, Any]) -> None:
+        for item in sorted(directory.iterdir(), key=lambda path: path.name):
+            if item.is_symlink():
+                raise SystemExit(f"ASAR 源目录包含不支持的软链接: {item}")
+            if item.is_dir():
+                child: dict[str, Any] = {"files": {}}
+                node["files"][item.name] = child
+                walk(item, child)
+            elif item.is_file():
+                relative = str(item.relative_to(source_dir)).replace(os.sep, "/")
+                entry: dict[str, Any] = {"size": item.stat().st_size}
+                node["files"][item.name] = entry
+                file_entries.append((item, relative, entry))
+            else:
+                raise SystemExit(f"ASAR 源目录包含不支持的文件类型: {item}")
+
+    header: dict[str, Any] = {"files": {}}
+    walk(source_dir, header)
+
+    offset = 0
+    for path, relative, entry in file_entries:
+        entry["offset"] = str(offset)
+        entry["integrity"] = _asar_integrity(path)
+        if relative in unpacked:
+            # unpacked 文件不写入归档数据区，Electron 从同名 .unpacked 目录读取。
+            entry["unpacked"] = True
+            continue
+        offset += int(entry["size"])
+
+    header_string = json.dumps(header, separators=(",", ":"), ensure_ascii=False)
+    header_bytes = header_string.encode("utf-8")
+    payload_size = align4(4 + len(header_bytes))
+    header_size = 4 + payload_size
+    prefix = struct.pack("<II", 4, header_size)
+    payload = (
+        struct.pack("<II", payload_size, len(header_bytes))
+        + header_bytes
+        + b"\x00" * (payload_size - 4 - len(header_bytes))
+    )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    unpacked_root = Path(str(destination) + ".unpacked")
+    try:
+        with temporary.open("wb") as output:
+            output.write(prefix)
+            output.write(payload)
+            for path, relative, _entry in file_entries:
+                if relative in unpacked:
+                    continue
+                with path.open("rb") as source:
+                    shutil.copyfileobj(source, output)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    if unpacked:
+        unpacked_root.mkdir(parents=True, exist_ok=True)
+        for relative in sorted(unpacked):
+            source = source_dir / Path(*relative.split("/"))
+            target = unpacked_root / Path(*relative.split("/"))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+
+def get_frontend_bundle_mode(app: Path) -> str:
+    if (app / FRONTEND_ASAR_REL).is_file():
+        return "asar"
+    if (app / FRONTEND_DIR_REL).is_dir():
+        return "directory"
+    return "missing"
+
+
+def prepare_frontend_target(app: Path) -> dict[str, Any]:
+    """Expose the frontend bundle as a directory so the existing patches work unchanged.
+
+    Claude 4.29+ ships ``ion-dist.asar``; it is expanded into a temporary
+    ``ion-dist`` directory inside the patched app copy and repacked in
+    :func:`finalize_frontend_target`.
+    """
+    mode = get_frontend_bundle_mode(app)
+    asar = app / FRONTEND_ASAR_REL
+    directory = app / FRONTEND_DIR_REL
+    if mode == "asar":
+        if directory.exists():
+            raise SystemExit(f"前端目录与 ASAR 同时存在，无法安全判定布局: {directory}")
+        unpacked: set[str] = set()
+        extract_asar(asar, directory, unpacked)
+        print(f"Extracted ion-dist.asar for patching ({len(unpacked)} unpacked file(s))")
+        return {"mode": "asar", "work": directory, "asar": asar, "unpacked": unpacked}
+    if mode == "directory":
+        return {"mode": "directory", "work": directory, "asar": None, "unpacked": set()}
+    raise SystemExit(f"未找到前端资源: {directory} 或 {asar}")
+
+
+def finalize_frontend_target(app: Path, target: dict[str, Any]) -> None:
+    if target.get("mode") != "asar":
+        return
+    work: Path = target["work"]
+    asar: Path = target["asar"]
+    if not work.is_dir():
+        raise SystemExit(f"ASAR 临时工作目录不存在: {work}")
+
+    temporary = asar.with_name(asar.name + ".zh-cn-new")
+    print("Rebuilding ion-dist.asar...")
+    build_asar(work, temporary, target.get("unpacked") or set())
+    try:
+        data = temporary.read_bytes()
+        _header_size, _header_string, header = read_asar_header(data, temporary)
+        paths = {relative for relative, _entry in walk_asar_entries(header)}
+        has_i18n = "i18n/en-US.json" in paths
+        has_bundle = any(re.search(r"(^|/)assets/(?:[^/]+/)?index-[^/]+\.js$", path) for path in paths)
+        if not (has_i18n and has_bundle):
+            raise SystemExit("重新打包后的 ion-dist.asar 未通过结构校验。")
+        os.replace(temporary, asar)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    cleanup_frontend_target(target)
+    update_electron_asar_integrity(app, "Resources/ion-dist.asar", asar)
+    print("Rebuilt ion-dist.asar")
+
+
+def cleanup_frontend_target(target: dict[str, Any] | None) -> None:
+    if not target or target.get("mode") != "asar":
+        return
+    work = target.get("work")
+    if isinstance(work, Path) and work.exists():
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def compute_integrity_dictionary_digest(integrity: dict[str, Any]) -> str:
+    """Digest Electron's package-time integrity dictionary (sorted key + algorithm + hash)."""
+    hasher = hashlib.sha256()
+    for key in sorted(integrity):
+        entry = integrity[key]
+        hasher.update(key.encode("utf-8"))
+        hasher.update(str(entry.get("algorithm", "")).encode("utf-8"))
+        hasher.update(str(entry.get("hash", "")).encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def sync_integrity_digest_slot(app: Path, integrity: dict[str, Any]) -> int:
+    """Update the package-time dictionary digest slot inside Electron Framework.
+
+    Returns the number of patched slots (one per Mach-O slice). Older Electron
+    builds have no slot; those are left untouched.
+    """
+    framework = app / ELECTRON_FRAMEWORK_REL
+    if not framework.is_file():
+        return 0
+    data = bytearray(framework.read_bytes())
+    digest = bytes.fromhex(compute_integrity_dictionary_digest(integrity))
+    updated = 0
+    start = 0
+    while True:
+        index = data.find(INTEGRITY_DIGEST_SENTINEL, start)
+        if index < 0:
+            break
+        slot = index + len(INTEGRITY_DIGEST_SENTINEL)
+        if slot + 34 > len(data):
+            break
+        # used=0 表示打包时未启用字典摘要，保持 fail-open。
+        if data[slot] == 1:
+            data[slot] = 1
+            data[slot + 1] = 1
+            data[slot + 2 : slot + 34] = digest
+            updated += 1
+        start = index + 1
+    if updated:
+        framework.write_bytes(data)
+    return updated
+
+
+def verify_integrity_digest_slot(app: Path, integrity: dict[str, Any]) -> None:
+    framework = app / ELECTRON_FRAMEWORK_REL
+    if not framework.is_file():
+        return
+    data = framework.read_bytes()
+    expected = compute_integrity_dictionary_digest(integrity)
+    start = 0
+    checked = 0
+    while True:
+        index = data.find(INTEGRITY_DIGEST_SENTINEL, start)
+        if index < 0:
+            break
+        slot = index + len(INTEGRITY_DIGEST_SENTINEL)
+        if slot + 34 > len(data):
+            break
+        if data[slot] == 1:
+            actual = data[slot + 2 : slot + 34].hex()
+            if actual != expected:
+                raise SystemExit(
+                    "Electron integrity dictionary digest mismatch in Electron Framework: "
+                    f"binary has {actual!r}, expected {expected}."
+                )
+            checked += 1
+        start = index + 1
+    if checked:
+        print(f"Verified Electron integrity dictionary digest ({checked} slice(s))")
+
+
+def update_electron_asar_integrity(app: Path, key: str, asar_path: Path) -> bool:
+    """Sync Info.plist ElectronAsarIntegrity for *key* when the app declares it."""
+    info_plist = app / "Contents/Info.plist"
+    with info_plist.open("rb") as f:
+        info = plistlib.load(f)
+    integrity = info.get("ElectronAsarIntegrity")
+    if not isinstance(integrity, dict) or key not in integrity:
+        return False
+    data = asar_path.read_bytes()
+    _header_size, header_string, _header = read_asar_header(data, asar_path)
+    expected = asar_header_hash(header_string)
+    if integrity[key].get("hash") == expected:
+        return False
+    integrity[key]["hash"] = expected
+    with info_plist.open("wb") as f:
+        plistlib.dump(info, f, fmt=plistlib.FMT_BINARY, sort_keys=False)
+    sync_integrity_digest_slot(app, integrity)
+    return True
 
 
 
@@ -1475,42 +1812,65 @@ def restore_backup(app: Path, dry_run: bool) -> Path:
 
 
 def verify_electron_asar_integrity(app: Path) -> None:
-    asar_path = app / APP_ASAR_REL
-    data = asar_path.read_bytes()
-    _header_size, header_string, _header = read_asar_header(data, asar_path)
-    expected = hashlib.sha256(header_string.encode("utf-8")).hexdigest()
-
     info_plist = app / "Contents/Info.plist"
     with info_plist.open("rb") as f:
         info = plistlib.load(f)
-    actual = (
-        info.get("ElectronAsarIntegrity", {})
-        .get("Resources/app.asar", {})
-        .get("hash")
-    )
-    if actual != expected:
-        raise SystemExit(
-            "Electron app.asar integrity mismatch: "
-            f"Info.plist has {actual!r}, expected {expected}."
-        )
-    print("Verified Electron app.asar integrity")
+    integrity = info.get("ElectronAsarIntegrity", {})
+    if not isinstance(integrity, dict):
+        raise SystemExit("Unsupported ElectronAsarIntegrity shape in Info.plist.")
+
+    targets = [("Resources/app.asar", app / APP_ASAR_REL)]
+    frontend_asar = app / FRONTEND_ASAR_REL
+    if frontend_asar.is_file():
+        targets.append(("Resources/ion-dist.asar", frontend_asar))
+
+    for key, asar_path in targets:
+        entry = integrity.get(key)
+        # app.asar 必须由官方声明；ion-dist.asar 仅在应用声明了完整性时才校验。
+        if not isinstance(entry, dict):
+            if key == "Resources/app.asar":
+                raise SystemExit(f"Electron {key} integrity entry is missing from Info.plist.")
+            continue
+        data = asar_path.read_bytes()
+        _header_size, header_string, _header = read_asar_header(data, asar_path)
+        expected = asar_header_hash(header_string)
+        actual = entry.get("hash")
+        if actual != expected:
+            raise SystemExit(
+                f"Electron {key} integrity mismatch: "
+                f"Info.plist has {actual!r}, expected {expected}."
+            )
+        print(f"Verified Electron {key} integrity")
+    verify_integrity_digest_slot(app, integrity)
 
 
+
+
+def read_frontend_entry(app: Path, relative: str) -> bytes | None:
+    """Read one frontend file whether it lives in ion-dist/ or ion-dist.asar."""
+    asar = app / FRONTEND_ASAR_REL
+    if asar.is_file():
+        data = asar.read_bytes()
+        header_size, _header_string, header = read_asar_header(data, asar)
+        return read_asar_entry(data, header_size, header, relative)
+    path = app / FRONTEND_DIR_REL / relative
+    return path.read_bytes() if path.is_file() else None
 
 
 def verify(app: Path, lang_code: str) -> None:
     start = time.perf_counter()
-    frontend = app / FRONTEND_I18N_REL / f"{lang_code}.json"
-    data = load_json(frontend)
+    raw = read_frontend_entry(app, f"i18n/{lang_code}.json")
+    if raw is None:
+        raise SystemExit(f"Missing frontend i18n catalog: i18n/{lang_code}.json")
+    data = json.loads(raw.decode("utf-8"))
     values = [v for v in data.values() if isinstance(v, str)]
     chinese = sum(1 for v in values if re.search(r"[\u4e00-\u9fff]", v))
     print(f"Verified frontend {lang_code} JSON: {chinese}/{len(values)} strings contain Chinese")
 
-    dynamic_dir = app / FRONTEND_I18N_REL / "dynamic"
-    if (dynamic_dir / "en-US.json").exists():
-        if not (dynamic_dir / f"{lang_code}.json").exists():
+    if read_frontend_entry(app, "i18n/dynamic/en-US.json") is not None:
+        if read_frontend_entry(app, f"i18n/dynamic/{lang_code}.json") is None:
             raise SystemExit(
-                f"Missing required dynamic i18n catalog: {dynamic_dir / f'{lang_code}.json'}; "
+                f"Missing required dynamic i18n catalog: i18n/dynamic/{lang_code}.json; "
                 "Claude >= 2.9939.2 fails to load the language without it."
             )
         print(f"Verified frontend dynamic {lang_code} catalog exists")
@@ -1668,14 +2028,19 @@ def main() -> int:
     patched_app = tmp_root / "Claude.app"
 
     copy_app(args.app, patched_app)
-    patch_language_whitelist(patched_app, lang_code)
-    patch_hardcoded_frontend_strings(patched_app, lang_code)
-    patch_slash_command_menu(patched_app, lang_code)
-    patch_language_display_names(patched_app)
-    merge_frontend_locale(patched_app, lang_code)
-    install_desktop_locale(patched_app, lang_code)
-    install_statsig_locale(patched_app, lang_code)
-    install_dynamic_locale(patched_app, lang_code)
+    frontend_target = prepare_frontend_target(patched_app)
+    try:
+        patch_language_whitelist(patched_app, lang_code)
+        patch_hardcoded_frontend_strings(patched_app, lang_code)
+        patch_slash_command_menu(patched_app, lang_code)
+        patch_language_display_names(patched_app)
+        merge_frontend_locale(patched_app, lang_code)
+        install_desktop_locale(patched_app, lang_code)
+        install_statsig_locale(patched_app, lang_code)
+        install_dynamic_locale(patched_app, lang_code)
+        finalize_frontend_target(patched_app, frontend_target)
+    finally:
+        cleanup_frontend_target(frontend_target)
     resign_app(patched_app)
     clear_quarantine(patched_app)
     if args.dry_run:
