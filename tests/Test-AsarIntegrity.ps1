@@ -15,6 +15,7 @@ $ErrorActionPreference = 'Stop'
     'New-BackupSet',
     'Get-BackupRoot',
     'Backup-AppFile',
+    'Get-ClaudeExeIntegrityMarker',
     'Sync-ClaudeExeAsarIntegrity'
 )
 
@@ -59,6 +60,29 @@ try {
         throw 'ion-dist.asar integrity hash was not synchronized.'
     }
 
+
+    # --- Claude Desktop 4.4212+ 的 JSON 转义标记格式 ---
+    # 注意：Sync-ClaudeExeAsarIntegrity 会处理 resources 下所有存在的 asar，
+    # 所以 fixture 里必须把 app.asar 和 ion-dist.asar 两个标记都写上。
+    $bsx = [string][char]92
+    $jsonAppMarker = ('{"file":"resources' + $bsx + $bsx + 'app.asar","alg":"SHA256","value":"')
+    $jsonIonMarker = ('{"file":"resources' + $bsx + $bsx + 'ion-dist.asar","alg":"SHA256","value":"')
+    $jsonExeText = $jsonAppMarker + (Get-AsarHeaderHash $appAsar) + '"}PAD' +
+        $jsonIonMarker + ('0' * 64) + '"}PAD'
+    [IO.File]::WriteAllText($exe, $jsonExeText, [Text.Encoding]::ASCII)
+
+    Sync-ClaudeExeAsarIntegrity $resources
+
+    $jsonActual = [IO.File]::ReadAllText($exe, [Text.Encoding]::ASCII)
+    $jsonIonIndex = $jsonActual.IndexOf($jsonIonMarker, [StringComparison]::Ordinal) + $jsonIonMarker.Length
+    if ($jsonIonIndex -lt $jsonIonMarker.Length) {
+        throw 'JSON-style ion-dist.asar integrity marker went missing.'
+    }
+    if ($jsonActual.Substring($jsonIonIndex, 64) -ne (Get-AsarHeaderHash $ionAsar)) {
+        throw 'JSON-style ion-dist.asar integrity hash was not synchronized.'
+    }
+
+    Write-Host 'PASS: JSON-escaped integrity markers (Claude 4.4212+) are supported.' -ForegroundColor Green
     Write-Host 'PASS: Claude.exe integrity hashes cover app.asar and ion-dist.asar.' -ForegroundColor Green
 }
 finally {

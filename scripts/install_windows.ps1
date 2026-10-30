@@ -1264,6 +1264,41 @@ function Get-AsarHeaderHash {
     return Get-Sha256Hex ([System.Text.Encoding]::UTF8.GetBytes($parsed["HeaderString"]))
 }
 
+function Get-ClaudeExeIntegrityMarker {
+    param(
+        [string]$ExeText,
+        [string]$AsarName
+    )
+
+    # Claude Desktop 4.4212+ 把 Electron 的 ASAR integrity 记录改成了 JSON 转义形式：
+    #   {"file":"resources\\ion-dist.asar","alg":"SHA256","value":"<hash>"}
+    # 旧版本用的是裸相对路径（单反斜杠或双反斜杠两种写法都出现过）：
+    #   resources\ion-dist.asar","alg":"SHA256","value":"<hash>"
+    # 按优先级依次尝试，返回第一个在 ExeText 中唯一命中的标记。
+    $bs = [string][char]92
+    $fw = [string][char]47
+    $tail = '","alg":"SHA256","value":"'
+    $candidates = @(
+        ('{"file":"resources' + $bs + $bs + $AsarName + $tail),
+        ('resources' + $bs + $bs + $AsarName + $tail),
+        ('{"file":"resources' + $fw + $AsarName + $tail),
+        ('resources' + $fw + $AsarName + $tail)
+    )
+
+    foreach ($candidate in $candidates) {
+        $index = $ExeText.IndexOf($candidate, [System.StringComparison]::Ordinal)
+        if ($index -lt 0) {
+            continue
+        }
+        if ($ExeText.IndexOf($candidate, $index + 1, [System.StringComparison]::Ordinal) -ge 0) {
+            throw "Could not find a unique Claude.exe $AsarName integrity marker. Claude bundle format may have changed."
+        }
+        return $candidate
+    }
+
+    throw "Could not find Claude.exe $AsarName integrity marker. Claude bundle format may have changed."
+}
+
 function Sync-ClaudeExeAsarIntegrity {
     param([string]$ResourcesPath)
 
@@ -1284,16 +1319,9 @@ function Sync-ClaudeExeAsarIntegrity {
         $asarPath = Join-Path $ResourcesPath $asarName
         Write-Host "  [进度] 正在计算 $asarName header hash..." -ForegroundColor DarkGray
         $headerHash = Get-AsarHeaderHash $asarPath
-        $marker = 'resources\\' + $asarName + '","alg":"SHA256","value":"'
         $exeText = [System.IO.File]::ReadAllText($exePath, [System.Text.Encoding]::ASCII)
+        $marker = Get-ClaudeExeIntegrityMarker -ExeText $exeText -AsarName $asarName
         $markerIndex = $exeText.IndexOf($marker, [System.StringComparison]::Ordinal)
-        if ($markerIndex -lt 0) {
-            throw "Could not find Claude.exe $asarName integrity marker. Claude bundle format may have changed."
-        }
-        if ($exeText.IndexOf($marker, $markerIndex + 1, [System.StringComparison]::Ordinal) -ge 0) {
-            throw "Could not find a unique Claude.exe $asarName integrity marker. Claude bundle format may have changed."
-        }
-
         $hashOffset = $markerIndex + $marker.Length
         if (($hashOffset + 64) -gt $exeInfo.Length) {
             throw "Claude.exe $asarName integrity marker has invalid bounds."
