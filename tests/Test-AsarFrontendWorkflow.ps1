@@ -21,6 +21,7 @@ $ErrorActionPreference = 'Stop'
     'Get-ClaudeAppPathFromResources',
     'Backup-AppFile',
     'Get-AsarHeaderHash',
+    'Get-ClaudeExeIntegrityMarker',
     'Sync-ClaudeExeAsarIntegrity',
     'Remove-GeneratedFrontendWorkspace',
     'Initialize-FrontendPatchTarget',
